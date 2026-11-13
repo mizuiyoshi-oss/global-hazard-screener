@@ -123,11 +123,12 @@ def grade_flood_hazard(rp10_m, rp50_m, rp500_m, threshold_m=0.50):
     return "VERY LOW"
 
 def grade_tsunami_hazard(rp100_m, rp500_m, rp2500_m):
-    if rp100_m >= 0.50:
+    """Official ThinkHazard! criteria: >=2.0m damaging depth at RP100 (HIGH), RP500 (MEDIUM), >=1.0m at RP2500 (LOW)."""
+    if rp100_m >= 2.0:
         return "HIGH"
-    elif rp500_m >= 0.50:
+    elif rp500_m >= 2.0:
         return "MEDIUM"
-    elif rp2500_m > 0.10:
+    elif rp2500_m >= 1.0:
         return "LOW"
     return "VERY LOW"
 
@@ -158,7 +159,7 @@ def grade_landslide_hazard(combined_class):
 # ==============================================================================
 def geocode_dataframe(df):
     arcgis_coder = ArcGIS(timeout=10)
-    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v5", timeout=10)
+    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v7", timeout=10)
 
     df = df.copy()
     if "Lat" not in df.columns:
@@ -312,10 +313,16 @@ def sample_gee_cloud_rasters(df, asset_prefix):
     ]
 
     try:
-        priv_imgs = [
-            ee.Image(f"{asset_prefix}/{asset_name}").select([0]).unmask(default_val).multiply(mult).rename(col_name)
-            for asset_name, col_name, mult, default_val in private_specs
-        ]
+        priv_imgs = []
+        for asset_name, col_name, mult, default_val in private_specs:
+            raw_img = ee.Image(f"{asset_prefix}/{asset_name}").select([0]).unmask(default_val)
+            # Clean NoData values (e.g. 255 in uint8 Landslide TH ranks or negative NoData floats)
+            if col_name == "LS_Combined_Class":
+                clean_img = raw_img.where(raw_img.gt(4).Or(raw_img.lt(1)), 1).rename(col_name)
+            else:
+                clean_img = raw_img.where(raw_img.lt(0), 0.0).multiply(mult).rename(col_name)
+            priv_imgs.append(clean_img)
+
         priv_stack = ee.Image.cat(priv_imgs)
         priv_sampled = priv_stack.reduceRegions(collection=fc, reducer=ee.Reducer.first(), scale=90).getInfo()
         for feat in priv_sampled.get("features", []):
@@ -328,7 +335,11 @@ def sample_gee_cloud_rasters(df, asset_prefix):
         diagnostics.append(f"ℹ️ Batch private raster query fell back to individual asset check ({str(batch_err)[:80]})")
         for asset_name, col_name, mult, default_val in private_specs:
             try:
-                img = ee.Image(f"{asset_prefix}/{asset_name}").select([0]).unmask(default_val).multiply(mult).rename(col_name)
+                raw_img = ee.Image(f"{asset_prefix}/{asset_name}").select([0]).unmask(default_val)
+                if col_name == "LS_Combined_Class":
+                    img = raw_img.where(raw_img.gt(4).Or(raw_img.lt(1)), 1).rename(col_name)
+                else:
+                    img = raw_img.where(raw_img.lt(0), 0.0).multiply(mult).rename(col_name)
                 single_res = img.reduceRegions(collection=fc, reducer=ee.Reducer.first(), scale=90).getInfo()
                 for feat in single_res.get("features", []):
                     props = feat.get("properties", {})
@@ -344,7 +355,8 @@ def sample_gee_cloud_rasters(df, asset_prefix):
     # --- GROUP C: Private Uploaded Tsunami Table (gar15_tsunami_ptha) ---
     try:
         tsunami_fc = ee.FeatureCollection(f"{asset_prefix}/gar15_tsunami_ptha")
-        spatial_filter = ee.Filter.withinDistance(distance=50000, leftField=".geo", rightField=".geo", maxError=50)
+        # 80 km search radius so deep semi-enclosed bays (Manila Bay, Tokyo Bay, etc.) match open-shelf PTHA points
+        spatial_filter = ee.Filter.withinDistance(distance=80000, leftField=".geo", rightField=".geo", maxError=50)
         nearest_join = ee.Join.saveBest(matchKey="nearest_ptha", measureKey="coast_dist_m")
         joined_fc = nearest_join.apply(fc, tsunami_fc, spatial_filter)
         for feat in joined_fc.getInfo().get("features", []):
@@ -440,17 +452,20 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
             cf_rp10 = cf_rp50 = cf_rp100 = cf_rp250 = cf_rp500 = cf_rp1000 = 0.0
 
         # 5. Tsunami Overland Attenuation Curve (m)
-        if "TS_H0_500_m" in g_props:
+        if "TS_H0_500_m" in g_props and elev < 35.0:
             ptha_dist_km = float(g_props["TS_Coast_Dist_km"])
-            overland_km = max(0.0, ptha_dist_km - 12.0) if elev < 20.0 else max(0.0, ptha_dist_km - 4.0)
-            est_coast_dist_km = round(overland_km, 2)
+            # PTHA points sit on the offshore 50-100m depth contour; estimate overland distance from site elevation/HAND
+            overland_km = round(min(ptha_dist_km, max(0.0, hand_m * 0.25 if elev < 12.0 else elev * 0.20)), 2)
+            est_coast_dist_km = overland_km
+            # Bay entrance damping (for points >25 km inside semi-enclosed bays) + overland roughness head loss
+            bay_damping = 0.65 if ptha_dist_km > 25.0 else 1.0
             roughness_loss = 1.5 * overland_km
-            ts_rp100 = round(max(0.0, g_props["TS_H0_100_m"] - elev - roughness_loss), 2)
-            ts_rp500 = round(max(0.0, g_props["TS_H0_500_m"] - elev - roughness_loss), 2)
-            ts_rp1000 = round(max(0.0, g_props["TS_H0_1000_m"] - elev - roughness_loss), 2)
-            ts_rp2500 = round(max(0.0, g_props["TS_H0_2500_m"] - elev - roughness_loss), 2)
+            ts_rp100 = round(max(0.0, g_props["TS_H0_100_m"] * bay_damping - elev - roughness_loss), 2)
+            ts_rp500 = round(max(0.0, g_props["TS_H0_500_m"] * bay_damping - elev - roughness_loss), 2)
+            ts_rp1000 = round(max(0.0, g_props["TS_H0_1000_m"] * bay_damping - elev - roughness_loss), 2)
+            ts_rp2500 = round(max(0.0, g_props["TS_H0_2500_m"] * bay_damping - elev - roughness_loss), 2)
         else:
-            est_coast_dist_km = 50.0
+            est_coast_dist_km = 80.0
             ts_rp100 = ts_rp500 = ts_rp1000 = ts_rp2500 = 0.0
 
         # 6. Tropical Cyclone Wind Curve (3-sec Gust km/h)
@@ -471,11 +486,14 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
             eq_pga_475 = 0.0
             eq_pga_2475 = 0.0
 
-        # 8. Landslide Hazard Index (1 to 4)
+        # 8. Landslide Hazard Index (1 to 4, clamping uint8 255 NoData to 1)
         if "LS_Combined_Class" in g_props and g_props["LS_Combined_Class"] is not None:
-            ls_combined = max(1, int(round(float(g_props.get("LS_Combined_Class", 1) or 1))))
-            ls_rain = round(float(g_props.get("LS_Rain_Index", 0.0) or 0.0), 5)
-            ls_quake = round(float(g_props.get("LS_Quake_Index", 0.0) or 0.0), 5)
+            raw_ls = int(round(float(g_props.get("LS_Combined_Class", 1) or 1)))
+            ls_combined = raw_ls if 1 <= raw_ls <= 4 else 1
+            raw_rain = float(g_props.get("LS_Rain_Index", 0.0) or 0.0)
+            raw_quake = float(g_props.get("LS_Quake_Index", 0.0) or 0.0)
+            ls_rain = round(raw_rain if 0.0 <= raw_rain <= 10.0 else 0.0, 5)
+            ls_quake = round(raw_quake if 0.0 <= raw_quake <= 10.0 else 0.0, 5)
         else:
             ls_combined = 1
             ls_rain = 0.0
