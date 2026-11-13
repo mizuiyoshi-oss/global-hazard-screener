@@ -18,13 +18,22 @@ except ImportError:
     GEE_AVAILABLE = False
 
 # ==============================================================================
-# 1. PAGE CONFIGURATION
+# 1. PAGE CONFIGURATION & SESSION STATE INITIALIZATION
 # ==============================================================================
 st.set_page_config(
     page_title="Global High-Res Multi-Peril Hazard Screener",
     page_icon="🌍",
     layout="wide"
 )
+
+if "result_version" not in st.session_state:
+    st.session_state["result_version"] = 0
+if "picker_version" not in st.session_state:
+    st.session_state["picker_version"] = 0
+if "picker_center" not in st.session_state:
+    st.session_state["picker_center"] = [35.6812, 139.7671]  # Default: Tokyo
+if "picker_zoom" not in st.session_state:
+    st.session_state["picker_zoom"] = 5
 
 st.title("🌍 Open-Source High-Resolution Multi-Peril Natural Hazard & Elevation Screener")
 st.markdown(
@@ -167,7 +176,7 @@ def reverse_geocode_point(lat, lon):
     except Exception:
         pass
     try:
-        nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v8", timeout=8)
+        nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v9", timeout=8)
         loc_osm = nominatim_coder.reverse((lat, lon), language="en")
         if loc_osm and loc_osm.address:
             return loc_osm.address, "Clicked Map Point (OSM Reverse)"
@@ -177,7 +186,7 @@ def reverse_geocode_point(lat, lon):
 
 def geocode_dataframe(df):
     arcgis_coder = ArcGIS(timeout=10)
-    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v8", timeout=10)
+    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v9", timeout=10)
 
     df = df.copy()
     if "Lat" not in df.columns:
@@ -336,7 +345,6 @@ def sample_gee_cloud_rasters(df, asset_prefix):
         priv_imgs = []
         for asset_name, col_name, mult, default_val in private_specs:
             raw_img = ee.Image(f"{asset_prefix}/{asset_name}").select([0]).unmask(default_val)
-            # Clean NoData values (e.g. 255 in uint8 Landslide TH ranks or negative NoData floats)
             if col_name == "LS_Combined_Class":
                 clean_img = raw_img.where(raw_img.gt(4).Or(raw_img.lt(1)), 1).rename(col_name)
             else:
@@ -375,7 +383,6 @@ def sample_gee_cloud_rasters(df, asset_prefix):
     # --- GROUP C: Private Uploaded Tsunami Table (gar15_tsunami_ptha) ---
     try:
         tsunami_fc = ee.FeatureCollection(f"{asset_prefix}/gar15_tsunami_ptha")
-        # 80 km search radius so deep semi-enclosed bays (Manila Bay, Tokyo Bay, etc.) match open-shelf PTHA points
         spatial_filter = ee.Filter.withinDistance(distance=80000, leftField=".geo", rightField=".geo", maxError=50)
         nearest_join = ee.Join.saveBest(matchKey="nearest_ptha", measureKey="coast_dist_m")
         joined_fc = nearest_join.apply(fc, tsunami_fc, spatial_filter)
@@ -474,10 +481,8 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
         # 5. Tsunami Overland Attenuation Curve (m)
         if "TS_H0_500_m" in g_props and elev < 35.0:
             ptha_dist_km = float(g_props["TS_Coast_Dist_km"])
-            # PTHA points sit on the offshore 50-100m depth contour; estimate overland distance from site elevation/HAND
             overland_km = round(min(ptha_dist_km, max(0.0, hand_m * 0.25 if elev < 12.0 else elev * 0.20)), 2)
             est_coast_dist_km = overland_km
-            # Bay entrance damping (for points >25 km inside semi-enclosed bays) + overland roughness head loss
             bay_damping = 0.65 if ptha_dist_km > 25.0 else 1.0
             roughness_loss = 1.5 * overland_km
             ts_rp100 = round(max(0.0, g_props["TS_H0_100_m"] * bay_damping - elev - roughness_loss), 2)
@@ -555,6 +560,28 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
 
     return pd.concat([df.reset_index(drop=True), pd.DataFrame(records)], axis=1), diagnostics
 
+def run_single_point_screening(lat, lon, custom_name=""):
+    """Helper to reverse-geocode and run full 7-peril GEE screening for a single coordinate."""
+    with st.spinner(f"Identifying location ({lat:.6f}, {lon:.6f}) and sampling Google Earth Engine Hazard Rasters..."):
+        matched_addr, precision_label = reverse_geocode_point(lat, lon)
+        site_label = custom_name.strip() if custom_name.strip() else matched_addr.split(",")[0].strip()
+        if not site_label:
+            site_label = f"Point ({lat:.4f}, {lon:.4f})"
+
+        clicked_df = pd.DataFrame([{
+            "Location_ID": "CLICK-01",
+            "Name": site_label,
+            "Address_or_Postal": matched_addr,
+            "Lat": lat,
+            "Lon": lon,
+            "Matched_Address": matched_addr,
+            "Geocode_Precision": precision_label
+        }])
+        res_df, diag_logs = evaluate_all_perils(clicked_df, use_gee=gee_connected, asset_prefix=gee_project)
+        st.session_state["results_df"] = res_df
+        st.session_state["diag_logs"] = diag_logs
+        st.session_state["result_version"] += 1
+
 # ==============================================================================
 # 5. INPUT LAYER UI (MANUAL TABLE, CSV BATCH, AND INTERACTIVE MAP CLICK)
 # ==============================================================================
@@ -599,29 +626,15 @@ with tab_csv:
             trigger_df = csv_preview.copy()
 
 with tab_map:
-    st.caption("Click anywhere on the map below to automatically identify the exact coordinate, reverse-geocode the address, and run the 7-peril hazard screening.")
+    st.caption("Click any location on the map below (or search a place) to automatically extract coordinates, reverse-geocode the address, and refresh Section 2.")
 
-    if "picker_center" not in st.session_state:
-        st.session_state["picker_center"] = [35.6812, 139.7671]  # Default: Tokyo
-    if "picker_zoom" not in st.session_state:
-        st.session_state["picker_zoom"] = 5
-
-    col_search, col_btn, col_custom_name = st.columns([3, 1, 2])
+    col_search, col_btn_zoom, col_custom_name = st.columns([3, 1, 2])
     with col_search:
         zoom_query = st.text_input(
-            "🔎 Optional: Search a city, address, or landmark to zoom the map",
+            "🔎 Search a city, address, or landmark to move the map",
             placeholder="e.g., Taylor, TX or Kochi, Japan or Jurong Island, Singapore",
             label_visibility="collapsed"
         )
-    with col_btn:
-        if st.button("Zoom to Place") and zoom_query.strip():
-            try:
-                loc_zoom = ArcGIS(timeout=10).geocode(zoom_query.strip())
-                if loc_zoom:
-                    st.session_state["picker_center"] = [float(loc_zoom.latitude), float(loc_zoom.longitude)]
-                    st.session_state["picker_zoom"] = 14
-            except Exception:
-                pass
     with col_custom_name:
         custom_click_name = st.text_input(
             "Optional custom site name",
@@ -629,6 +642,21 @@ with tab_map:
             placeholder="Optional custom site name (auto-named if blank)",
             label_visibility="collapsed"
         )
+    with col_btn_zoom:
+        if st.button("🔎 Zoom & Screen") and zoom_query.strip():
+            try:
+                loc_zoom = ArcGIS(timeout=10).geocode(zoom_query.strip())
+                if loc_zoom:
+                    z_lat = round(float(loc_zoom.latitude), 6)
+                    z_lon = round(float(loc_zoom.longitude), 6)
+                    st.session_state["picker_center"] = [z_lat, z_lon]
+                    st.session_state["picker_zoom"] = 14
+                    st.session_state["last_clicked_point"] = (z_lat, z_lon)
+                    st.session_state["last_evaluated_click"] = (z_lat, z_lon)
+                    st.session_state["picker_version"] += 1
+                    run_single_point_screening(z_lat, z_lon, custom_click_name)
+            except Exception as e:
+                st.warning(f"Search error: {e}")
 
     picker_m = folium.Map(
         location=st.session_state["picker_center"],
@@ -650,50 +678,40 @@ with tab_map:
         folium.Marker(
             location=[prev_lat, prev_lon],
             tooltip=f"Selected: {prev_lat:.6f}, {prev_lon:.6f}",
-            icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")
+            icon=folium.Icon(color="red", icon="info-sign")
         ).add_to(picker_m)
 
     folium.LayerControl().add_to(picker_m)
-    map_click_data = st_folium(picker_m, width=920, height=440, key="interactive_picker_map")
+
+    # returned_objects=["last_clicked"] prevents panning/zooming from triggering unwanted reruns
+    map_click_data = st_folium(
+        picker_m,
+        width=920,
+        height=430,
+        returned_objects=["last_clicked"],
+        key=f"interactive_picker_map_{st.session_state['picker_version']}"
+    )
 
     if map_click_data and map_click_data.get("last_clicked"):
         clicked_lat = round(float(map_click_data["last_clicked"]["lat"]), 6)
         clicked_lon = round(float(map_click_data["last_clicked"]["lng"]), 6)
         clicked_pair = (clicked_lat, clicked_lon)
-
         st.session_state["last_clicked_point"] = clicked_pair
         st.session_state["picker_center"] = [clicked_lat, clicked_lon]
 
-        # Automatically trigger screening whenever a new point is clicked (or if the user clicks Re-run)
-        rerun_clicked = st.button("🔄 Re-run Hazard Screening for This Clicked Point")
-        if st.session_state.get("last_evaluated_click") != clicked_pair or rerun_clicked:
+        if st.session_state.get("last_evaluated_click") != clicked_pair:
             st.session_state["last_evaluated_click"] = clicked_pair
-            with st.spinner(f"Identifying location ({clicked_lat:.6f}, {clicked_lon:.6f}) and sampling Google Earth Engine Hazard Rasters..."):
-                matched_addr, precision_label = reverse_geocode_point(clicked_lat, clicked_lon)
-                site_label = custom_click_name.strip() if custom_click_name.strip() else matched_addr.split(",")[0].strip()
-                if not site_label:
-                    site_label = f"Point ({clicked_lat:.4f}, {clicked_lon:.4f})"
+            run_single_point_screening(clicked_lat, clicked_lon, custom_click_name)
 
-                clicked_df = pd.DataFrame([{
-                    "Location_ID": "CLICK-01",
-                    "Name": site_label,
-                    "Address_or_Postal": matched_addr,
-                    "Lat": clicked_lat,
-                    "Lon": clicked_lon,
-                    "Matched_Address": matched_addr,
-                    "Geocode_Precision": precision_label
-                }])
-                res_df, diag_logs = evaluate_all_perils(clicked_df, use_gee=gee_connected, asset_prefix=gee_project)
-                st.session_state["results_df"] = res_df
-                st.session_state["diag_logs"] = diag_logs
-
-        if "results_df" in st.session_state and len(st.session_state["results_df"]) == 1 and st.session_state["results_df"].iloc[0]["Location_ID"] == "CLICK-01":
-            r0 = st.session_state["results_df"].iloc[0]
-            st.success(
-                f"📍 **Identified Location:** {r0['Matched_Address']} | "
-                f"**Lat/Lon:** `{clicked_lat:.6f}, {clicked_lon:.6f}` | "
-                f"**Elevation (GLO-30):** `{r0['Elev_GLO30_m']} m` — Scroll down for full 7-peril output!"
-            )
+    if "last_clicked_point" in st.session_state:
+        sel_lat, sel_lon = st.session_state["last_clicked_point"]
+        col_info, col_refresh = st.columns([3, 1])
+        with col_info:
+            st.info(f"📌 **Selected Map Coordinate:** `{sel_lat:.6f}, {sel_lon:.6f}`")
+        with col_refresh:
+            if st.button("🔄 Run / Refresh Screening for Selected Point", type="primary"):
+                st.session_state["last_evaluated_click"] = (sel_lat, sel_lon)
+                run_single_point_screening(sel_lat, sel_lon, custom_click_name)
 
 # Execute batch/manual trigger if clicked from Tab 1 or Tab 2
 if not trigger_df.empty:
@@ -706,21 +724,34 @@ if not trigger_df.empty:
             res_df, diag_logs = evaluate_all_perils(valid_rows, use_gee=gee_connected, asset_prefix=gee_project)
             st.session_state["results_df"] = res_df
             st.session_state["diag_logs"] = diag_logs
+            st.session_state["result_version"] += 1
 
 # ==============================================================================
-# 6. OUTPUT LAYER UI
+# 6. OUTPUT LAYER UI (DYNAMICALLY VERSIONED SO IT ALWAYS UPDATES)
 # ==============================================================================
 if "results_df" in st.session_state:
     res_df = st.session_state["results_df"]
     diag_logs = st.session_state.get("diag_logs", [])
+    ver = st.session_state.get("result_version", 0)
+
+    st.divider()
+    hdr_left, hdr_mid, hdr_right = st.columns([3, 1, 1])
+    with hdr_left:
+        st.subheader("2. Interactive Multi-Peril Map & Hazard Curve Output")
+    with hdr_mid:
+        if st.button("🔄 Refresh Output View"):
+            st.session_state["result_version"] += 1
+            st.rerun()
+    with hdr_right:
+        if st.button("🗑️ Clear Results"):
+            st.session_state.pop("results_df", None)
+            st.session_state["result_version"] += 1
+            st.rerun()
 
     if diag_logs:
         with st.expander("🔍 GEE Cloud Layer Diagnostics (Click to inspect asset status)", expanded=False):
             for msg in diag_logs:
                 st.write(msg)
-
-    st.divider()
-    st.subheader("2. Interactive Multi-Peril Map & Hazard Curve Output")
 
     col_left, col_right = st.columns([3, 2])
 
@@ -732,7 +763,7 @@ if "results_df" in st.session_state:
         )
         default_zoom = 13 if len(res_df) == 1 else 3
         m = folium.Map(
-            location=[res_df["Lat"].mean(), res_df["Lon"].mean()],
+            location=[float(res_df["Lat"].mean()), float(res_df["Lon"].mean())],
             zoom_start=default_zoom,
             tiles="OpenStreetMap"
         )
@@ -771,14 +802,21 @@ if "results_df" in st.session_state:
             </div>
             """
             folium.Marker(
-                location=[r["Lat"], r["Lon"]],
+                location=[float(r["Lat"]), float(r["Lon"])],
                 popup=folium.Popup(popup_html, max_width=340),
                 tooltip=f"{r['Name']} | Elev: {r['Elev_GLO30_m']}m | {color_peril}: {grade_val}",
                 icon=folium.Icon(color=marker_color, icon="info-sign")
             ).add_to(m)
 
         folium.LayerControl().add_to(m)
-        st_folium(m, width=720, height=480, key="results_output_map")
+        # Dynamic key tied to result_version forces the output map to re-center on every update
+        st_folium(
+            m,
+            width=720,
+            height=480,
+            returned_objects=[],
+            key=f"results_output_map_v{ver}_{color_peril}"
+        )
 
     with col_right:
         st.markdown("##### Executive Summary: ThinkHazard! Risk Grades")
