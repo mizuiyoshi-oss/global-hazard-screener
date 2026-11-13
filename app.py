@@ -572,4 +572,3 @@ if "results_df" in st.session_state:
 
     st.markdown("##### Complete Quantitative Return-Period Hazard Curve Table (All 42 Columns)")
     st.dataframe(res_df, use_container_width=True)
-```
