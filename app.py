@@ -157,9 +157,27 @@ def grade_landslide_hazard(combined_class):
 # ==============================================================================
 # 4. GEOCODING & FAULT-TOLERANT MULTI-PERIL GEE ENGINE
 # ==============================================================================
+def reverse_geocode_point(lat, lon):
+    """Reverse-geocodes a clicked Lat/Lon coordinate into a readable address."""
+    try:
+        arcgis_coder = ArcGIS(timeout=8)
+        loc = arcgis_coder.reverse((lat, lon))
+        if loc and loc.address:
+            return loc.address, "Clicked Map Point (ArcGIS Reverse)"
+    except Exception:
+        pass
+    try:
+        nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v8", timeout=8)
+        loc_osm = nominatim_coder.reverse((lat, lon), language="en")
+        if loc_osm and loc_osm.address:
+            return loc_osm.address, "Clicked Map Point (OSM Reverse)"
+    except Exception:
+        pass
+    return f"Clicked Coordinate ({lat:.5f}, {lon:.5f})", "Clicked Map Coordinate"
+
 def geocode_dataframe(df):
     arcgis_coder = ArcGIS(timeout=10)
-    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v7", timeout=10)
+    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v8", timeout=10)
 
     df = df.copy()
     if "Lat" not in df.columns:
@@ -186,8 +204,10 @@ def geocode_dataframe(df):
         if has_coords:
             df.at[idx, "Lat"] = float(lat_val)
             df.at[idx, "Lon"] = float(lon_val)
-            df.at[idx, "Matched_Address"] = "User-Provided Coordinates"
-            df.at[idx, "Geocode_Precision"] = "Exact Coordinate"
+            if not str(row.get("Matched_Address", "")).strip():
+                df.at[idx, "Matched_Address"] = "User-Provided Coordinates"
+            if not str(row.get("Geocode_Precision", "")).strip():
+                df.at[idx, "Geocode_Precision"] = "Exact Coordinate"
         else:
             query = str(row.get("Address_or_Postal", "")).strip()
             if query and query.lower() not in ("none", "nan"):
@@ -536,10 +556,14 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
     return pd.concat([df.reset_index(drop=True), pd.DataFrame(records)], axis=1), diagnostics
 
 # ==============================================================================
-# 5. INPUT LAYER UI
+# 5. INPUT LAYER UI (MANUAL TABLE, CSV BATCH, AND INTERACTIVE MAP CLICK)
 # ==============================================================================
 st.subheader("1. Input Locations (Single or Batch)")
-tab_manual, tab_csv = st.tabs(["📝 Manual Table Input", "📂 Upload CSV File"])
+tab_manual, tab_csv, tab_map = st.tabs([
+    "📝 Manual Table Input",
+    "📂 Upload CSV File",
+    "🗺️ Interactive Map Click"
+])
 
 trigger_df = pd.DataFrame()
 
@@ -574,6 +598,104 @@ with tab_csv:
         if st.button("🚀 Run Multi-Peril Hazard Screening (CSV Batch)", type="primary"):
             trigger_df = csv_preview.copy()
 
+with tab_map:
+    st.caption("Click anywhere on the map below to automatically identify the exact coordinate, reverse-geocode the address, and run the 7-peril hazard screening.")
+
+    if "picker_center" not in st.session_state:
+        st.session_state["picker_center"] = [35.6812, 139.7671]  # Default: Tokyo
+    if "picker_zoom" not in st.session_state:
+        st.session_state["picker_zoom"] = 5
+
+    col_search, col_btn, col_custom_name = st.columns([3, 1, 2])
+    with col_search:
+        zoom_query = st.text_input(
+            "🔎 Optional: Search a city, address, or landmark to zoom the map",
+            placeholder="e.g., Taylor, TX or Kochi, Japan or Jurong Island, Singapore",
+            label_visibility="collapsed"
+        )
+    with col_btn:
+        if st.button("Zoom to Place") and zoom_query.strip():
+            try:
+                loc_zoom = ArcGIS(timeout=10).geocode(zoom_query.strip())
+                if loc_zoom:
+                    st.session_state["picker_center"] = [float(loc_zoom.latitude), float(loc_zoom.longitude)]
+                    st.session_state["picker_zoom"] = 14
+            except Exception:
+                pass
+    with col_custom_name:
+        custom_click_name = st.text_input(
+            "Optional custom site name",
+            value="",
+            placeholder="Optional custom site name (auto-named if blank)",
+            label_visibility="collapsed"
+        )
+
+    picker_m = folium.Map(
+        location=st.session_state["picker_center"],
+        zoom_start=st.session_state["picker_zoom"],
+        tiles="OpenStreetMap"
+    )
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Esri World Imagery (Satellite)",
+        overlay=False,
+        control=True
+    ).add_to(picker_m)
+    folium.TileLayer("OpenTopoMap", name="Topographic Terrain Contours").add_to(picker_m)
+    folium.LatLngPopup().add_to(picker_m)
+
+    if "last_clicked_point" in st.session_state:
+        prev_lat, prev_lon = st.session_state["last_clicked_point"]
+        folium.Marker(
+            location=[prev_lat, prev_lon],
+            tooltip=f"Selected: {prev_lat:.6f}, {prev_lon:.6f}",
+            icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")
+        ).add_to(picker_m)
+
+    folium.LayerControl().add_to(picker_m)
+    map_click_data = st_folium(picker_m, width=920, height=440, key="interactive_picker_map")
+
+    if map_click_data and map_click_data.get("last_clicked"):
+        clicked_lat = round(float(map_click_data["last_clicked"]["lat"]), 6)
+        clicked_lon = round(float(map_click_data["last_clicked"]["lng"]), 6)
+        clicked_pair = (clicked_lat, clicked_lon)
+
+        st.session_state["last_clicked_point"] = clicked_pair
+        st.session_state["picker_center"] = [clicked_lat, clicked_lon]
+
+        # Automatically trigger screening whenever a new point is clicked (or if the user clicks Re-run)
+        rerun_clicked = st.button("🔄 Re-run Hazard Screening for This Clicked Point")
+        if st.session_state.get("last_evaluated_click") != clicked_pair or rerun_clicked:
+            st.session_state["last_evaluated_click"] = clicked_pair
+            with st.spinner(f"Identifying location ({clicked_lat:.6f}, {clicked_lon:.6f}) and sampling Google Earth Engine Hazard Rasters..."):
+                matched_addr, precision_label = reverse_geocode_point(clicked_lat, clicked_lon)
+                site_label = custom_click_name.strip() if custom_click_name.strip() else matched_addr.split(",")[0].strip()
+                if not site_label:
+                    site_label = f"Point ({clicked_lat:.4f}, {clicked_lon:.4f})"
+
+                clicked_df = pd.DataFrame([{
+                    "Location_ID": "CLICK-01",
+                    "Name": site_label,
+                    "Address_or_Postal": matched_addr,
+                    "Lat": clicked_lat,
+                    "Lon": clicked_lon,
+                    "Matched_Address": matched_addr,
+                    "Geocode_Precision": precision_label
+                }])
+                res_df, diag_logs = evaluate_all_perils(clicked_df, use_gee=gee_connected, asset_prefix=gee_project)
+                st.session_state["results_df"] = res_df
+                st.session_state["diag_logs"] = diag_logs
+
+        if "results_df" in st.session_state and len(st.session_state["results_df"]) == 1 and st.session_state["results_df"].iloc[0]["Location_ID"] == "CLICK-01":
+            r0 = st.session_state["results_df"].iloc[0]
+            st.success(
+                f"📍 **Identified Location:** {r0['Matched_Address']} | "
+                f"**Lat/Lon:** `{clicked_lat:.6f}, {clicked_lon:.6f}` | "
+                f"**Elevation (GLO-30):** `{r0['Elev_GLO30_m']} m` — Scroll down for full 7-peril output!"
+            )
+
+# Execute batch/manual trigger if clicked from Tab 1 or Tab 2
 if not trigger_df.empty:
     with st.spinner("Geocoding locations and sampling Google Earth Engine Hazard Rasters..."):
         geocoded = geocode_dataframe(trigger_df)
@@ -608,11 +730,19 @@ if "results_df" in st.session_state:
             ["TH_River_Flood", "TH_Urban_Flood", "TH_Coastal_Flood", "TH_Tsunami", "TH_Cyclone", "TH_Earthquake", "TH_Landslide"],
             index=0
         )
+        default_zoom = 13 if len(res_df) == 1 else 3
         m = folium.Map(
             location=[res_df["Lat"].mean(), res_df["Lon"].mean()],
-            zoom_start=3,
+            zoom_start=default_zoom,
             tiles="OpenStreetMap"
         )
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri",
+            name="Esri World Imagery (Satellite)",
+            overlay=False,
+            control=True
+        ).add_to(m)
         folium.TileLayer("OpenTopoMap", name="Topographic Terrain Contours").add_to(m)
 
         pin_colors = {"HIGH": "red", "MEDIUM": "orange", "LOW": "blue", "VERY LOW": "green"}
@@ -648,7 +778,7 @@ if "results_df" in st.session_state:
             ).add_to(m)
 
         folium.LayerControl().add_to(m)
-        st_folium(m, width=720, height=480)
+        st_folium(m, width=720, height=480, key="results_output_map")
 
     with col_right:
         st.markdown("##### Executive Summary: ThinkHazard! Risk Grades")
