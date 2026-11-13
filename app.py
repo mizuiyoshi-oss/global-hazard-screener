@@ -12,6 +12,7 @@ from geopy.geocoders import Nominatim, ArcGIS
 
 try:
     import ee
+    from google.oauth2 import service_account
     GEE_AVAILABLE = True
 except ImportError:
     GEE_AVAILABLE = False
@@ -33,7 +34,7 @@ st.markdown(
 )
 
 # ==============================================================================
-# 2. GOOGLE EARTH ENGINE INITIALIZATION
+# 2. GOOGLE EARTH ENGINE INITIALIZATION (AUTO-FIXES MISSING TOML FIELDS)
 # ==============================================================================
 @st.cache_resource
 def initialize_gee():
@@ -41,22 +42,47 @@ def initialize_gee():
         return False, "earthengine-api not installed"
     try:
         if "gee_service_account" in st.secrets:
-            sa_info = dict(st.secrets["gee_service_account"])
-            credentials = ee.ServiceAccountCredentials(
-                sa_info["client_email"],
-                key_data=json.dumps(sa_info)
+            sa_raw = st.secrets["gee_service_account"]
+            if isinstance(sa_raw, str):
+                sa_info = json.loads(sa_raw, strict=False)
+            else:
+                sa_info = dict(sa_raw)
+
+            # Inject required OAuth2 fields if omitted from Streamlit Secrets TOML
+            sa_info.setdefault("type", "service_account")
+            sa_info.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+            sa_info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+            sa_info.setdefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
+
+            # Normalize escaped newlines in private_key
+            if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
+                sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
+
+            scopes = getattr(
+                ee.oauth,
+                "SCOPES",
+                [
+                    "https://www.googleapis.com/auth/earthengine",
+                    "https://www.googleapis.com/auth/cloud-platform",
+                ],
+            )
+            credentials = service_account.Credentials.from_service_account_info(
+                sa_info, scopes=scopes
             )
             ee.Initialize(credentials=credentials, project=sa_info.get("project_id"))
             return True, f"Connected to Google Earth Engine Cloud ({sa_info.get('project_id')})"
     except Exception as e:
-        return False, f"GEE Cloud Auth Error: {str(e)[:120]}"
+        return False, f"GEE Cloud Auth Error: {type(e).__name__}: {str(e)}"
     return False, "Running in Instant API + Terrain Proxy Mode (Add GEE Service Account in Secrets)"
 
 gee_connected, gee_status_msg = initialize_gee()
 
 default_project_id = "my-hazard-screener-2026"
 if "gee_service_account" in st.secrets:
-    default_project_id = st.secrets["gee_service_account"].get("project_id", default_project_id)
+    try:
+        default_project_id = st.secrets["gee_service_account"].get("project_id", default_project_id)
+    except Exception:
+        pass
 
 with st.sidebar:
     st.header("⚙️ System Status & Settings")
@@ -132,16 +158,20 @@ def grade_landslide_hazard(combined_class):
 # ==============================================================================
 def geocode_dataframe(df):
     arcgis_coder = ArcGIS(timeout=10)
-    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v4", timeout=10)
+    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v5", timeout=10)
 
     df = df.copy()
+    if "Lat" not in df.columns:
+        df["Lat"] = np.nan
+    if "Lon" not in df.columns:
+        df["Lon"] = np.nan
     if "Matched_Address" not in df.columns:
         df["Matched_Address"] = ""
     if "Geocode_Precision" not in df.columns:
         df["Geocode_Precision"] = ""
 
     progress = st.progress(0, text="Geocoding locations...")
-    total = len(df)
+    total = max(1, len(df))
     coord_pattern = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 
     for i, (idx, row) in enumerate(df.iterrows()):
@@ -159,7 +189,7 @@ def geocode_dataframe(df):
             df.at[idx, "Geocode_Precision"] = "Exact Coordinate"
         else:
             query = str(row.get("Address_or_Postal", "")).strip()
-            if query and query.lower() != "none":
+            if query and query.lower() not in ("none", "nan"):
                 coord_match = coord_pattern.match(query)
                 if coord_match:
                     df.at[idx, "Lat"] = round(float(coord_match.group(1)), 6)
@@ -225,12 +255,6 @@ def fetch_open_meteo_dem_and_slope(lats, lons):
     return elevs, slopes
 
 def sample_gee_cloud_rasters(df, asset_prefix):
-    """
-    Fault-tolerant GEE sampler:
-    - Group A: Public Catalog (Copernicus GLO-30 DEM, MERIT Hydro 90m HAND, JRC GloFAS v2.1 RP10-RP500)
-    - Group B: Private Uploaded GeoTIFFs (GEM PGA, GFDRR Landslide, STORM Cyclone Wind)
-    - Group C: Private Uploaded Tsunami PTHA Table (50 km coastal radius)
-    """
     gee_dict = {int(idx): {} for idx in df.index}
     diagnostics = []
 
@@ -252,7 +276,6 @@ def sample_gee_cloud_rasters(df, asset_prefix):
         slope_img = ee.Terrain.slope(dem_img).rename("Slope_deg")
         merit = ee.Image("MERIT/Hydro/v1_0_1").select(["hnd", "upa"], ["HAND_m", "UPA_km2"]).unmask(0)
 
-        # JRC GloFAS v2.1 stores return periods as explicit band names: RP10_depth .. RP500_depth
         jrc_mosaic = (
             ee.ImageCollection("JRC/CEMS_GLOFAS/FloodHazard/v2_1")
             .select(
@@ -275,7 +298,7 @@ def sample_gee_cloud_rasters(df, asset_prefix):
         diagnostics.append(f"⚠️ Public GEE Catalog error: {str(e)[:120]}")
 
     # --- GROUP B: Private Uploaded Raster Assets ---
-    gust_factor = 4.428  # WMO 10-min m/s to 3-sec gust km/h
+    gust_factor = 4.428
     private_specs = [
         ("gem_pga_475", "EQ_PGA_RP475_g", 1.0, 0.0),
         ("gfdrr_landslide_th", "LS_Combined_Class", 1.0, 1.0),
@@ -321,7 +344,6 @@ def sample_gee_cloud_rasters(df, asset_prefix):
     # --- GROUP C: Private Uploaded Tsunami Table (gar15_tsunami_ptha) ---
     try:
         tsunami_fc = ee.FeatureCollection(f"{asset_prefix}/gar15_tsunami_ptha")
-        # 50 km search radius to capture offshore PTHA points along bays and shelves
         spatial_filter = ee.Filter.withinDistance(distance=50000, leftField=".geo", rightField=".geo", maxError=50)
         nearest_join = ee.Join.saveBest(matchKey="nearest_ptha", measureKey="coast_dist_m")
         joined_fc = nearest_join.apply(fc, tsunami_fc, spatial_filter)
@@ -353,7 +375,6 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
     if use_gee:
         gee_results, diagnostics = sample_gee_cloud_rasters(df, asset_prefix)
 
-    # Always fetch Open-Meteo 30m DEM as a backup for any missing elevation/slope values
     om_elevs, om_slopes = fetch_open_meteo_dem_and_slope(lats, lons)
 
     records = []
@@ -379,7 +400,7 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
         upa_m = float(g_props.get("UPA_km2", 1.5) or 1.5) * 1000.0
         twi = round(math.log(max(1.0, upa_m / math.tan(slope_rad))), 2)
 
-        # 2. River Flood Curve (m) from JRC GloFAS v2.1
+        # 2. River Flood Curve (m)
         if "FL_RP100_m" in g_props and g_props["FL_RP100_m"] is not None:
             fl_rp10 = round(float(g_props.get("FL_RP10_m", 0.0) or 0.0), 2)
             fl_rp20 = round(float(g_props.get("FL_RP20_m", 0.0) or 0.0), 2)
@@ -421,7 +442,6 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
         # 5. Tsunami Overland Attenuation Curve (m)
         if "TS_H0_500_m" in g_props:
             ptha_dist_km = float(g_props["TS_Coast_Dist_km"])
-            # Subtract offshore buoy water distance (~12 km shelf offset) to get true inland overland travel
             overland_km = max(0.0, ptha_dist_km - 12.0) if elev < 20.0 else max(0.0, ptha_dist_km - 4.0)
             est_coast_dist_km = round(overland_km, 2)
             roughness_loss = 1.5 * overland_km
@@ -461,7 +481,6 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
             ls_rain = 0.0
             ls_quake = 0.0
 
-        # Compute ThinkHazard! Standardized Qualitative Grades
         th_river = grade_flood_hazard(fl_rp10, fl_rp50, fl_rp500)
         th_urban = grade_flood_hazard(uf_rp10, uf_rp50, uf_rp500)
         th_coastal = grade_flood_hazard(cf_rp10, cf_rp50, cf_rp500)
@@ -518,7 +537,6 @@ with tab_manual:
     edited_table = st.data_editor(
         sample_locations,
         num_rows="dynamic",
-        use_container_width=True,
         column_config={
             "Lat": st.column_config.NumberColumn("Lat", format="%.6f"),
             "Lon": st.column_config.NumberColumn("Lon", format="%.6f"),
@@ -534,7 +552,7 @@ with tab_csv:
     uploaded_csv = st.file_uploader("Drag and drop your CSV file here", type=["csv"])
     if uploaded_csv is not None:
         csv_preview = pd.read_csv(uploaded_csv)
-        st.dataframe(csv_preview.head(10), use_container_width=True)
+        st.dataframe(csv_preview.head(10))
         if st.button("🚀 Run Multi-Peril Hazard Screening (CSV Batch)", type="primary"):
             trigger_df = csv_preview.copy()
 
@@ -575,9 +593,8 @@ if "results_df" in st.session_state:
         m = folium.Map(
             location=[res_df["Lat"].mean(), res_df["Lon"].mean()],
             zoom_start=3,
-            tiles="CartoDB positron"
+            tiles="OpenStreetMap"
         )
-        folium.TileLayer("OpenStreetMap", name="OpenStreetMap Street View").add_to(m)
         folium.TileLayer("OpenTopoMap", name="Topographic Terrain Contours").add_to(m)
 
         pin_colors = {"HIGH": "red", "MEDIUM": "orange", "LOW": "blue", "VERY LOW": "green"}
@@ -622,7 +639,7 @@ if "results_df" in st.session_state:
             "TH_River_Flood", "TH_Urban_Flood", "TH_Coastal_Flood",
             "TH_Tsunami", "TH_Cyclone", "TH_Earthquake", "TH_Landslide"
         ]
-        st.dataframe(res_df[exec_cols], use_container_width=True, height=390)
+        st.dataframe(res_df[exec_cols], height=390)
 
         csv_export = res_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
@@ -630,9 +647,8 @@ if "results_df" in st.session_state:
             data=csv_export,
             file_name="multi_peril_hazard_return_periods_export.csv",
             mime="text/csv",
-            type="primary",
-            use_container_width=True
+            type="primary"
         )
 
     st.markdown("##### Complete Quantitative Return-Period Hazard Curve Table (All 42 Columns)")
-    st.dataframe(res_df, use_container_width=True)
+    st.dataframe(res_df)
