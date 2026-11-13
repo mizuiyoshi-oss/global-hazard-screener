@@ -17,7 +17,7 @@ except ImportError:
     GEE_AVAILABLE = False
 
 # ==============================================================================
-# 1. PAGE CONFIGURATION & STYLING
+# 1. PAGE CONFIGURATION
 # ==============================================================================
 st.set_page_config(
     page_title="Global High-Res Multi-Peril Hazard Screener",
@@ -132,7 +132,7 @@ def grade_landslide_hazard(combined_class):
 # ==============================================================================
 def geocode_dataframe(df):
     arcgis_coder = ArcGIS(timeout=10)
-    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v2", timeout=10)
+    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v3", timeout=10)
 
     df = df.copy()
     if "Matched_Address" not in df.columns:
@@ -159,7 +159,7 @@ def geocode_dataframe(df):
             df.at[idx, "Geocode_Precision"] = "Exact Coordinate"
         else:
             query = str(row.get("Address_or_Postal", "")).strip()
-            if query:
+            if query and query.lower() != "none":
                 coord_match = coord_pattern.match(query)
                 if coord_match:
                     df.at[idx, "Lat"] = round(float(coord_match.group(1)), 6)
@@ -232,63 +232,68 @@ def sample_gee_cloud_rasters(df, asset_prefix):
     fc = ee.FeatureCollection(features)
 
     # 1. Public Catalog: Elevation, Slope, HAND & UPA
-    dem_img = ee.ImageCollection("COPERNICUS/DEM/GLO30").select("DEM").mosaic().setDefaultProjection("EPSG:4326", None, 30)
+    dem_img = (
+        ee.ImageCollection("COPERNICUS/DEM/GLO30")
+        .select("DEM")
+        .mosaic()
+        .setDefaultProjection("EPSG:4326", None, 30)
+    )
     slope_img = ee.Terrain.slope(dem_img).rename("Slope_deg")
     merit = ee.Image("MERIT/Hydro/v1_0_1").select(["hnd", "upa"], ["HAND_m", "UPA_km2"])
 
     # 2. Public Catalog: JRC GloFAS v2.1 River Flood (90m)
     jrc_col = ee.ImageCollection("JRC/CEMS_GLOFAS/FloodHazard/v2_1")
     fl_bands = [
-        jrc_col.filter(ee.Filter.eq("return_period", rp)).mosaic().unmask(0).rename(f"FL_RP{rp}_m")
+        jrc_col.filter(ee.Filter.eq("return_period", rp)).mosaic().select([0]).unmask(0).rename(f"FL_RP{rp}_m")
         for rp in [10, 20, 50, 100, 200, 500]
     ]
 
-    # 3. Public Catalog: WRI Aqueduct Coastal Surge (m)
-    wri_img = ee.Image("WRI/Aqueduct_Flood_Hazard_Maps/V2")
-    cf_bands = [
-        wri_img.select(f"inuncoast_historical_wtsub_hist_rp{rp:04d}_0").unmask(0).rename(f"CF_RP{rp}_m")
-        for rp in [10, 50, 100, 250, 500, 1000]
-    ]
-
-    # 4. Private Uploaded Raster Assets (GEM Seismic, GFDRR Landslide, STORM Cyclone)
-    gem_475 = ee.Image(f"{asset_prefix}/gem_pga_475").unmask(0).rename("EQ_PGA_RP475_g")
-    ls_th = ee.Image(f"{asset_prefix}/gfdrr_landslide_th").unmask(1).rename("LS_Combined_Class")
-    ls_rain = ee.Image(f"{asset_prefix}/gfdrr_landslide_rain").unmask(0).rename("LS_Rain_Index")
-    ls_quake = ee.Image(f"{asset_prefix}/gfdrr_landslide_quake").unmask(0).rename("LS_Quake_Index")
+    # 3. Private Uploaded Raster Assets (GEM Seismic, GFDRR Landslide, STORM Cyclone)
+    gem_475 = ee.Image(f"{asset_prefix}/gem_pga_475").select([0]).unmask(0).rename("EQ_PGA_RP475_g")
+    ls_th = ee.Image(f"{asset_prefix}/gfdrr_landslide_th").select([0]).unmask(1).rename("LS_Combined_Class")
+    ls_rain = ee.Image(f"{asset_prefix}/gfdrr_landslide_rain").select([0]).unmask(0).rename("LS_Rain_Index")
+    ls_quake = ee.Image(f"{asset_prefix}/gfdrr_landslide_quake").select([0]).unmask(0).rename("LS_Quake_Index")
 
     gust_factor = 4.428
-    cy_50 = ee.Image(f"{asset_prefix}/storm_wind_rp50").unmask(0).multiply(gust_factor).rename("CY_RP50_kmh")
-    cy_100 = ee.Image(f"{asset_prefix}/storm_wind_rp100").unmask(0).multiply(gust_factor).rename("CY_RP100_kmh")
-    cy_200 = ee.Image(f"{asset_prefix}/storm_wind_rp200").unmask(0).multiply(gust_factor).rename("CY_RP200_kmh")
-    cy_500 = ee.Image(f"{asset_prefix}/storm_wind_rp500").unmask(0).multiply(gust_factor).rename("CY_RP500_kmh")
-    cy_1000 = ee.Image(f"{asset_prefix}/storm_wind_rp1000").unmask(0).multiply(gust_factor).rename("CY_RP1000_kmh")
+    cy_50 = ee.Image(f"{asset_prefix}/storm_wind_rp50").select([0]).unmask(0).multiply(gust_factor).rename("CY_RP50_kmh")
+    cy_100 = ee.Image(f"{asset_prefix}/storm_wind_rp100").select([0]).unmask(0).multiply(gust_factor).rename("CY_RP100_kmh")
+    cy_200 = ee.Image(f"{asset_prefix}/storm_wind_rp200").select([0]).unmask(0).multiply(gust_factor).rename("CY_RP200_kmh")
+    cy_500 = ee.Image(f"{asset_prefix}/storm_wind_rp500").select([0]).unmask(0).multiply(gust_factor).rename("CY_RP500_kmh")
+    cy_1000 = ee.Image(f"{asset_prefix}/storm_wind_rp1000").select([0]).unmask(0).multiply(gust_factor).rename("CY_RP1000_kmh")
 
     raster_stack = ee.Image.cat(
-        [dem_img.rename("Elev_GLO30_m"), slope_img, merit] +
-        fl_bands + cf_bands +
-        [gem_475, ls_th, ls_rain, ls_quake, cy_50, cy_100, cy_200, cy_500, cy_1000]
+        [dem_img.rename("Elev_GLO30_m"), slope_img, merit]
+        + fl_bands
+        + [gem_475, ls_th, ls_rain, ls_quake, cy_50, cy_100, cy_200, cy_500, cy_1000]
     )
     sampled_fc = raster_stack.reduceRegions(collection=fc, reducer=ee.Reducer.first(), scale=30)
 
-    # 5. Spatial Join to Nearest GAR15 Tsunami Coastal Point within 15 km
-    tsunami_fc = ee.FeatureCollection(f"{asset_prefix}/gar15_tsunami_ptha")
-    spatial_filter = ee.Filter.withinDistance(distance=15000, leftField=".geo", rightField=".geo", maxError=10)
-    nearest_join = ee.Join.saveBest(matchKey="nearest_ptha", measureKey="coast_dist_m")
-    joined_fc = nearest_join.apply(sampled_fc, tsunami_fc, spatial_filter)
-
     gee_dict = {}
-    for feat in joined_fc.getInfo().get("features", []):
+    for feat in sampled_fc.getInfo().get("features", []):
         props = feat.get("properties", {})
         r_idx = props.get("row_idx")
-        ptha_match = props.pop("nearest_ptha", None)
-        if ptha_match and "properties" in ptha_match:
-            p_props = ptha_match["properties"]
-            props["TS_Coast_Dist_km"] = round(float(p_props.get("coast_dist_m", 0.0)) / 1000.0, 2)
-            props["TS_H0_100_m"] = float(p_props.get("ari100", 0.0) or 0.0)
-            props["TS_H0_500_m"] = float(p_props.get("ari500", 0.0) or 0.0)
-            props["TS_H0_1000_m"] = float(p_props.get("ari1000", 0.0) or 0.0)
-            props["TS_H0_2500_m"] = float(p_props.get("ari2500", 0.0) or 0.0)
         gee_dict[r_idx] = props
+
+    # 4. Spatial Join to Nearest GAR15 Tsunami Coastal Point within 15 km
+    try:
+        tsunami_fc = ee.FeatureCollection(f"{asset_prefix}/gar15_tsunami_ptha")
+        spatial_filter = ee.Filter.withinDistance(distance=15000, leftField=".geo", rightField=".geo", maxError=10)
+        nearest_join = ee.Join.saveBest(matchKey="nearest_ptha", measureKey="coast_dist_m")
+        joined_fc = nearest_join.apply(fc, tsunami_fc, spatial_filter)
+        for feat in joined_fc.getInfo().get("features", []):
+            props = feat.get("properties", {})
+            r_idx = props.get("row_idx")
+            ptha_match = props.get("nearest_ptha")
+            if ptha_match and "properties" in ptha_match and r_idx in gee_dict:
+                p_props = ptha_match["properties"]
+                gee_dict[r_idx]["TS_Coast_Dist_km"] = round(float(p_props.get("coast_dist_m", 0.0)) / 1000.0, 2)
+                gee_dict[r_idx]["TS_H0_100_m"] = float(p_props.get("ari100", 0.0) or 0.0)
+                gee_dict[r_idx]["TS_H0_500_m"] = float(p_props.get("ari500", 0.0) or 0.0)
+                gee_dict[r_idx]["TS_H0_1000_m"] = float(p_props.get("ari1000", 0.0) or 0.0)
+                gee_dict[r_idx]["TS_H0_2500_m"] = float(p_props.get("ari2500", 0.0) or 0.0)
+    except Exception as e:
+        st.warning(f"Tsunami table lookup note: {e}")
+
     return gee_dict
 
 def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
@@ -357,14 +362,7 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
         uf_adm2_baseline = grade_flood_hazard(uf_rp10, uf_rp50, uf_rp500)
 
         # 4. Coastal Surge Curve (m)
-        if "CF_RP100_m" in g_props and g_props["CF_RP100_m"] is not None:
-            cf_rp10 = round(float(g_props.get("CF_RP10_m", 0.0) or 0.0), 2)
-            cf_rp50 = round(float(g_props.get("CF_RP50_m", 0.0) or 0.0), 2)
-            cf_rp100 = round(float(g_props.get("CF_RP100_m", 0.0) or 0.0), 2)
-            cf_rp250 = round(float(g_props.get("CF_RP250_m", 0.0) or 0.0), 2)
-            cf_rp500 = round(float(g_props.get("CF_RP500_m", 0.0) or 0.0), 2)
-            cf_rp1000 = round(float(g_props.get("CF_RP1000_m", 0.0) or 0.0), 2)
-        elif elev <= 15.0:
+        if elev <= 15.0:
             cf_rp10 = round(max(0.0, 1.8 - elev * 0.45), 2)
             cf_rp50 = round(max(0.0, 2.5 - elev * 0.45), 2)
             cf_rp100 = round(max(0.0, 3.0 - elev * 0.45), 2)
@@ -462,11 +460,19 @@ trigger_df = pd.DataFrame()
 with tab_manual:
     st.caption("Edit cells directly or click the bottom row to add new locations. Provide an Address/Postal Code OR exact Lat/Lon coordinates.")
     sample_locations = pd.DataFrame([
-        {"Location_ID": "LOC-01", "Name": "Samsung Taylor Semiconductor", "Address_or_Postal": "1530 FM973, Taylor, TX 76574, United States", "Lat": None, "Lon": None},
-        {"Location_ID": "LOC-02", "Name": "Tokyo Bay Coastal Logistics", "Address_or_Postal": "Harumi, Chuo-ku, Tokyo, Japan", "Lat": None, "Lon": None},
-        {"Location_ID": "LOC-03", "Name": "Omiya Inland Office", "Address_or_Postal": "Sakuragicho, Omiya-ku, Saitama, Japan", "Lat": None, "Lon": None},
+        {"Location_ID": "LOC-01", "Name": "Samsung Taylor Semiconductor", "Address_or_Postal": "1530 FM973, Taylor, TX 76574, United States", "Lat": np.nan, "Lon": np.nan},
+        {"Location_ID": "LOC-02", "Name": "Tokyo Bay Coastal Logistics", "Address_or_Postal": "Harumi, Chuo-ku, Tokyo, Japan", "Lat": np.nan, "Lon": np.nan},
+        {"Location_ID": "LOC-03", "Name": "Omiya Inland Office", "Address_or_Postal": "Sakuragicho, Omiya-ku, Saitama, Japan", "Lat": np.nan, "Lon": np.nan},
     ])
-    edited_table = st.data_editor(sample_locations, num_rows="dynamic", use_container_width=True)
+    edited_table = st.data_editor(
+        sample_locations,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Lat": st.column_config.NumberColumn("Lat", format="%.6f"),
+            "Lon": st.column_config.NumberColumn("Lon", format="%.6f"),
+        }
+    )
     if st.button("🚀 Run Multi-Peril Hazard Screening (Manual Input)", type="primary"):
         trigger_df = edited_table.copy()
 
