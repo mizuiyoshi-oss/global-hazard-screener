@@ -37,9 +37,11 @@ if "picker_zoom" not in st.session_state:
 
 st.title("🌍 Open-Source High-Resolution Multi-Peril Natural Hazard & Elevation Screener")
 st.markdown(
-    "Coordinate-level screening for **Elevation ($30\\text{ m}$ Copernicus DEM)** and **7 Natural Perils** "
-    "(*River Flood, Urban Flood, Coastal Flood, Tsunami, Tropical Cyclone, Earthquake, and Landslide*). "
-    "Outputs both **full return-period hazard curves** and **World Bank GFDRR ThinkHazard! classifications**."
+    "**Zero-Assumption Primary Data Edition:** Evaluates **4 Direct-Raster Perils** "
+    "(*River Flood, Tropical Cyclone, Earthquake, and Landslide*) with **ThinkHazard! classifications**, "
+    "plus **100% raw topographic, hydrographic, and UNDRR GAR15 Tsunami shoreline metrics** "
+    "(*Elevation, HAND, Slope, Upstream Catchment Area, and Offshore Tsunami Wave Heights*) to indirectly evaluate "
+    "**Urban Pluvial Flood, Coastal Surge, and Tsunami** exposure without synthetic assumptions."
 )
 
 # ==============================================================================
@@ -57,13 +59,11 @@ def initialize_gee():
             else:
                 sa_info = dict(sa_raw)
 
-            # Inject required OAuth2 fields if omitted from Streamlit Secrets TOML
             sa_info.setdefault("type", "service_account")
             sa_info.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
             sa_info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
             sa_info.setdefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
 
-            # Normalize escaped newlines in private_key
             if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
                 sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
 
@@ -82,7 +82,7 @@ def initialize_gee():
             return True, f"Connected to Google Earth Engine Cloud ({sa_info.get('project_id')})"
     except Exception as e:
         return False, f"GEE Cloud Auth Error: {type(e).__name__}: {str(e)}"
-    return False, "Running in Instant API + Terrain Proxy Mode (Add GEE Service Account in Secrets)"
+    return False, "GEE Not Connected (Add GEE Service Account in Secrets)"
 
 gee_connected, gee_status_msg = initialize_gee()
 
@@ -107,22 +107,26 @@ with st.sidebar:
     ).rstrip("/")
 
     st.markdown("---")
-    st.subheader("Methodology Reference")
+    st.subheader("100% Raw Data Sources")
     st.markdown(
-        "- **Elevation:** Copernicus GLO-30 ($30\\text{ m}$)\n"
+        "**Graded Perils (Direct 2D Rasters):**\n"
         "- **River Flood:** JRC GloFAS v2.1 ($90\\text{ m}$, $RP10\\text{--}500$)\n"
-        "- **Coastal Surge:** WRI Aqueduct v2 ($RP10\\text{--}1000$)\n"
-        "- **Urban Flood:** $30\\text{ m}/90\\text{ m}$ HAND + TWI Pluvial Model\n"
-        "- **Tsunami:** UNDRR GAR15 PTHA + $30\\text{ m}$ DEM Attenuation\n"
-        "- **Cyclone:** STORM Constant Baseline ($RP50\\text{--}1000$)\n"
-        "- **Seismic:** GEM Global Seismic Hazard ($PGA$ at $RP475$)\n"
-        "- **Landslide:** World Bank GFDRR ($1\\text{ km}$)"
+        "- **Cyclone:** STORM 10-min Sustained Wind ($\\text{m/s}$, $RP50\\text{--}1000$)\n"
+        "- **Seismic:** GEM Global Seismic ($PGA$ at $RP475$)\n"
+        "- **Landslide:** World Bank GFDRR ($1\\text{ km}$, Class 1–4)\n\n"
+        "**Indirect Risk Metrics (Raw Physical Data):**\n"
+        "- **Elevation & Slope:** Copernicus GLO-30 ($30\\text{ m}$)\n"
+        "- **HAND & Catchment:** MERIT Hydro v1.0.1 ($90\\text{ m}$)\n"
+        "- **Tsunami Shoreline $H_0$:** UNDRR GAR15 PTHA ($RP100\\text{--}2500$)"
     )
 
 # ==============================================================================
-# 3. THINKHAZARD! CLASSIFICATION FUNCTIONS
+# 3. CLASSIFICATION FUNCTIONS (ONLY FOR THE 4 PURE-RASTER PERILS)
 # ==============================================================================
-def grade_flood_hazard(rp10_m, rp50_m, rp500_m, threshold_m=0.50):
+def grade_river_flood_hazard(rp10_m, rp50_m, rp500_m, threshold_m=0.50):
+    """Official ThinkHazard! river flood criteria on raw JRC depths (m)."""
+    if pd.isna(rp10_m) or pd.isna(rp50_m) or pd.isna(rp500_m):
+        return "N/A"
     if rp10_m >= threshold_m:
         return "HIGH"
     elif rp50_m >= threshold_m:
@@ -131,26 +135,27 @@ def grade_flood_hazard(rp10_m, rp50_m, rp500_m, threshold_m=0.50):
         return "LOW"
     return "VERY LOW"
 
-def grade_tsunami_hazard(rp100_m, rp500_m, rp2500_m):
-    """Official ThinkHazard! criteria: >=2.0m damaging depth at RP100 (HIGH), RP500 (MEDIUM), >=1.0m at RP2500 (LOW)."""
-    if rp100_m >= 2.0:
+def grade_cyclone_hazard_ms(rp50_ms, rp100_ms, rp500_ms):
+    """
+    Grades Tropical Cyclone hazard directly on raw STORM 10-minute sustained wind speeds (m/s):
+    - HIGH: RP50 >= 33.0 m/s (Typhoon / Hurricane force at 50-yr return period)
+    - MEDIUM: RP100 >= 29.0 m/s (Severe Tropical Storm force at 100-yr return period)
+    - LOW: RP500 >= 20.0 m/s (Gale / Tropical Storm force at 500-yr return period)
+    """
+    if pd.isna(rp50_ms) or pd.isna(rp100_ms) or pd.isna(rp500_ms):
+        return "N/A"
+    if rp50_ms >= 33.0:
         return "HIGH"
-    elif rp500_m >= 2.0:
+    elif rp100_ms >= 29.0:
         return "MEDIUM"
-    elif rp2500_m >= 1.0:
-        return "LOW"
-    return "VERY LOW"
-
-def grade_cyclone_hazard(rp50_kmh, rp100_kmh, rp500_kmh):
-    if rp50_kmh >= 140.0:
-        return "HIGH"
-    elif rp100_kmh >= 119.0:
-        return "MEDIUM"
-    elif rp500_kmh >= 90.0:
+    elif rp500_ms >= 20.0:
         return "LOW"
     return "VERY LOW"
 
 def grade_earthquake_hazard(pga_475_g):
+    """Grades Earthquake hazard directly on raw GEM RP475 PGA (g)."""
+    if pd.isna(pga_475_g):
+        return "N/A"
     if pga_475_g >= 0.20:
         return "HIGH"
     elif pga_475_g >= 0.10:
@@ -160,14 +165,16 @@ def grade_earthquake_hazard(pga_475_g):
     return "VERY LOW"
 
 def grade_landslide_hazard(combined_class):
+    """Grades Landslide hazard directly on raw GFDRR Combined Class (1 to 4)."""
+    if pd.isna(combined_class):
+        return "N/A"
     mapping = {4: "HIGH", 3: "MEDIUM", 2: "LOW", 1: "VERY LOW"}
     return mapping.get(int(round(combined_class)), "VERY LOW")
 
 # ==============================================================================
-# 4. GEOCODING & FAULT-TOLERANT MULTI-PERIL GEE ENGINE
+# 4. GEOCODING & PURE ORIGINAL DATA SAMPLING ENGINE
 # ==============================================================================
 def reverse_geocode_point(lat, lon):
-    """Reverse-geocodes a clicked Lat/Lon coordinate into a readable address."""
     try:
         arcgis_coder = ArcGIS(timeout=8)
         loc = arcgis_coder.reverse((lat, lon))
@@ -176,7 +183,7 @@ def reverse_geocode_point(lat, lon):
     except Exception:
         pass
     try:
-        nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v9", timeout=8)
+        nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v10", timeout=8)
         loc_osm = nominatim_coder.reverse((lat, lon), language="en")
         if loc_osm and loc_osm.address:
             return loc_osm.address, "Clicked Map Point (OSM Reverse)"
@@ -186,7 +193,7 @@ def reverse_geocode_point(lat, lon):
 
 def geocode_dataframe(df):
     arcgis_coder = ArcGIS(timeout=10)
-    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v9", timeout=10)
+    nominatim_coder = Nominatim(user_agent="global_multi_peril_hazard_screener_v10", timeout=10)
 
     df = df.copy()
     if "Lat" not in df.columns:
@@ -255,6 +262,7 @@ def geocode_dataframe(df):
     return df
 
 def fetch_open_meteo_dem_and_slope(lats, lons):
+    """Fallback Copernicus GLO-90/GLO-30 API query only for elevation & slope if GEE is offline."""
     elevs, slopes = [], []
     delta = 0.00027
     for i in range(0, len(lats), 25):
@@ -270,18 +278,22 @@ def fetch_open_meteo_dem_and_slope(lats, lons):
             url = f"https://api.open-meteo.com/v1/elevation?latitude={lat_str}&longitude={lon_str}"
             res = requests.get(url, timeout=15).json().get("elevation", [])
             for j in range(0, len(res), 3):
-                z0 = float(res[j]) if res[j] is not None else 0.0
+                z0 = float(res[j]) if res[j] is not None else np.nan
                 z_n = float(res[j+1]) if j+1 < len(res) and res[j+1] is not None else z0
                 z_e = float(res[j+2]) if j+2 < len(res) and res[j+2] is not None else z0
-                dz_dx = (z_e - z0) / 30.0
-                dz_dy = (z_n - z0) / 30.0
-                slope_deg = math.degrees(math.atan(math.sqrt(dz_dx**2 + dz_dy**2)))
-                elevs.append(round(z0, 2))
-                slopes.append(round(slope_deg, 2))
+                if pd.notna(z0):
+                    dz_dx = (z_e - z0) / 30.0
+                    dz_dy = (z_n - z0) / 30.0
+                    slope_deg = math.degrees(math.atan(math.sqrt(dz_dx**2 + dz_dy**2)))
+                    elevs.append(round(z0, 2))
+                    slopes.append(round(slope_deg, 2))
+                else:
+                    elevs.append(np.nan)
+                    slopes.append(np.nan)
         except Exception:
             for _ in batch_lats:
-                elevs.append(10.0)
-                slopes.append(1.0)
+                elevs.append(np.nan)
+                slopes.append(np.nan)
     return elevs, slopes
 
 def sample_gee_cloud_rasters(df, asset_prefix):
@@ -294,7 +306,7 @@ def sample_gee_cloud_rasters(df, asset_prefix):
         features.append(ee.Feature(pt, {"row_idx": int(idx)}))
     fc = ee.FeatureCollection(features)
 
-    # --- GROUP A: Public Catalog (DEM + MERIT Hydro + JRC Flood v2.1) ---
+    # --- GROUP A: Public Catalog (Copernicus GLO-30 DEM + MERIT Hydro + JRC Flood v2.1) ---
     try:
         dem_img = (
             ee.ImageCollection("COPERNICUS/DEM/GLO30")
@@ -323,28 +335,28 @@ def sample_gee_cloud_rasters(df, asset_prefix):
             r_idx = props.get("row_idx")
             if r_idx in gee_dict:
                 gee_dict[r_idx].update(props)
-        diagnostics.append("✅ Public GEE Catalog (Copernicus DEM, MERIT HAND, JRC Flood RP10–RP500): Loaded")
+        diagnostics.append("✅ Public GEE Catalog (Copernicus GLO-30 DEM, MERIT Hydro HAND/UPA, JRC Flood RP10–RP500): Loaded")
     except Exception as e:
         diagnostics.append(f"⚠️ Public GEE Catalog error: {str(e)[:120]}")
 
-    # --- GROUP B: Private Uploaded Raster Assets ---
-    gust_factor = 4.428
+    # --- GROUP B: Private Uploaded Raster Assets (100% Unmodified Native Units) ---
     private_specs = [
         ("gem_pga_475", "EQ_PGA_RP475_g", 1.0, 0.0),
         ("gfdrr_landslide_th", "LS_Combined_Class", 1.0, 1.0),
         ("gfdrr_landslide_rain", "LS_Rain_Index", 1.0, 0.0),
         ("gfdrr_landslide_quake", "LS_Quake_Index", 1.0, 0.0),
-        ("storm_wind_rp50", "CY_RP50_kmh", gust_factor, 0.0),
-        ("storm_wind_rp100", "CY_RP100_kmh", gust_factor, 0.0),
-        ("storm_wind_rp200", "CY_RP200_kmh", gust_factor, 0.0),
-        ("storm_wind_rp500", "CY_RP500_kmh", gust_factor, 0.0),
-        ("storm_wind_rp1000", "CY_RP1000_kmh", gust_factor, 0.0),
+        ("storm_wind_rp50", "CY_RP50_ms", 1.0, 0.0),
+        ("storm_wind_rp100", "CY_RP100_ms", 1.0, 0.0),
+        ("storm_wind_rp200", "CY_RP200_ms", 1.0, 0.0),
+        ("storm_wind_rp500", "CY_RP500_ms", 1.0, 0.0),
+        ("storm_wind_rp1000", "CY_RP1000_ms", 1.0, 0.0),
     ]
 
     try:
         priv_imgs = []
         for asset_name, col_name, mult, default_val in private_specs:
             raw_img = ee.Image(f"{asset_prefix}/{asset_name}").select([0]).unmask(default_val)
+            # Clean NoData values (255 in uint8 Landslide TH ranks or negative NoData floats)
             if col_name == "LS_Combined_Class":
                 clean_img = raw_img.where(raw_img.gt(4).Or(raw_img.lt(1)), 1).rename(col_name)
             else:
@@ -358,7 +370,7 @@ def sample_gee_cloud_rasters(df, asset_prefix):
             r_idx = props.get("row_idx")
             if r_idx in gee_dict:
                 gee_dict[r_idx].update(props)
-        diagnostics.append(f"✅ All 9 Private Raster Assets in `{asset_prefix}`: Loaded")
+        diagnostics.append(f"✅ All 9 Private Raster Assets in `{asset_prefix}` (Native Units): Loaded")
     except Exception as batch_err:
         diagnostics.append(f"ℹ️ Batch private raster query fell back to individual asset check ({str(batch_err)[:80]})")
         for asset_name, col_name, mult, default_val in private_specs:
@@ -380,7 +392,7 @@ def sample_gee_cloud_rasters(df, asset_prefix):
             except Exception as single_err:
                 diagnostics.append(f"  ❌ `{asset_prefix}/{asset_name}` failed: {str(single_err)[:90]}")
 
-    # --- GROUP C: Private Uploaded Tsunami Table (gar15_tsunami_ptha) ---
+    # --- GROUP C: Private Uploaded Tsunami Table (gar15_tsunami_ptha - 100% Raw Values) ---
     try:
         tsunami_fc = ee.FeatureCollection(f"{asset_prefix}/gar15_tsunami_ptha")
         spatial_filter = ee.Filter.withinDistance(distance=80000, leftField=".geo", rightField=".geo", maxError=50)
@@ -393,12 +405,12 @@ def sample_gee_cloud_rasters(df, asset_prefix):
             if ptha_match and "properties" in ptha_match and r_idx in gee_dict:
                 p_props = ptha_match["properties"]
                 raw_dist_km = float(p_props.get("coast_dist_m", 0.0)) / 1000.0
-                gee_dict[r_idx]["TS_Coast_Dist_km"] = round(raw_dist_km, 2)
-                gee_dict[r_idx]["TS_H0_100_m"] = float(p_props.get("ari100", 0.0) or 0.0)
-                gee_dict[r_idx]["TS_H0_500_m"] = float(p_props.get("ari500", 0.0) or 0.0)
-                gee_dict[r_idx]["TS_H0_1000_m"] = float(p_props.get("ari1000", 0.0) or 0.0)
-                gee_dict[r_idx]["TS_H0_2500_m"] = float(p_props.get("ari2500", 0.0) or 0.0)
-        diagnostics.append(f"✅ Tsunami PTHA Table (`{asset_prefix}/gar15_tsunami_ptha`): Loaded")
+                gee_dict[r_idx]["TS_Nearest_Point_Dist_km"] = round(raw_dist_km, 2)
+                gee_dict[r_idx]["TS_Shore_H0_RP100_m"] = round(float(p_props.get("ari100", 0.0) or 0.0), 2)
+                gee_dict[r_idx]["TS_Shore_H0_RP500_m"] = round(float(p_props.get("ari500", 0.0) or 0.0), 2)
+                gee_dict[r_idx]["TS_Shore_H0_RP1000_m"] = round(float(p_props.get("ari1000", 0.0) or 0.0), 2)
+                gee_dict[r_idx]["TS_Shore_H0_RP2500_m"] = round(float(p_props.get("ari2500", 0.0) or 0.0), 2)
+        diagnostics.append(f"✅ Tsunami PTHA Table (`{asset_prefix}/gar15_tsunami_ptha` Raw Shoreline H0): Loaded")
     except Exception as ts_err:
         diagnostics.append(f"❌ Tsunami PTHA Table (`{asset_prefix}/gar15_tsunami_ptha`) failed: {str(ts_err)[:100]}")
 
@@ -418,28 +430,22 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
 
     records = []
     for idx_pos, (r_idx, row) in enumerate(df.iterrows()):
-        lat = float(row["Lat"])
-        lon = float(row["Lon"])
         g_props = gee_results.get(int(r_idx), {})
 
+        # 1. Raw Terrain & Hydrography Metrics (Copernicus GLO-30 & MERIT Hydro v1.0.1)
         elev = g_props.get("Elev_GLO30_m")
         elev = round(float(elev), 2) if elev is not None else om_elevs[idx_pos]
 
         slope = g_props.get("Slope_deg")
-        slope = round(float(slope), 2) if slope is not None and float(slope) > 0 else om_slopes[idx_pos]
+        slope = round(float(slope), 2) if slope is not None else om_slopes[idx_pos]
 
-        # 1. Terrain & Micro-Topography
-        hand_m = g_props.get("HAND_m")
-        if hand_m is None:
-            hand_m = round(max(0.0, elev * 0.45 if elev < 25 else 12.0 + slope * 0.8), 2)
-        else:
-            hand_m = round(float(hand_m), 2)
+        hand_raw = g_props.get("HAND_m")
+        hand_m = round(float(hand_raw), 2) if hand_raw is not None else np.nan
 
-        slope_rad = math.radians(max(slope, 0.1))
-        upa_m = float(g_props.get("UPA_km2", 1.5) or 1.5) * 1000.0
-        twi = round(math.log(max(1.0, upa_m / math.tan(slope_rad))), 2)
+        upa_raw = g_props.get("UPA_km2")
+        upa_km2 = round(float(upa_raw), 2) if upa_raw is not None else np.nan
 
-        # 2. River Flood Curve (m)
+        # 2. River Flood Depth Curve (m) - Raw JRC GloFAS v2.1
         if "FL_RP100_m" in g_props and g_props["FL_RP100_m"] is not None:
             fl_rp10 = round(float(g_props.get("FL_RP10_m", 0.0) or 0.0), 2)
             fl_rp20 = round(float(g_props.get("FL_RP20_m", 0.0) or 0.0), 2)
@@ -448,70 +454,25 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
             fl_rp200 = round(float(g_props.get("FL_RP200_m", 0.0) or 0.0), 2)
             fl_rp500 = round(float(g_props.get("FL_RP500_m", 0.0) or 0.0), 2)
         else:
-            fl_rp10 = round(max(0.0, 2.2 - hand_m * 0.55), 2)
-            fl_rp20 = round(max(0.0, 2.7 - hand_m * 0.55), 2)
-            fl_rp50 = round(max(0.0, 3.4 - hand_m * 0.52), 2)
-            fl_rp100 = round(max(0.0, 4.1 - hand_m * 0.50), 2)
-            fl_rp200 = round(max(0.0, 4.7 - hand_m * 0.48), 2)
-            fl_rp500 = round(max(0.0, 5.5 - hand_m * 0.45), 2)
+            fl_rp10 = fl_rp20 = fl_rp50 = fl_rp100 = fl_rp200 = fl_rp500 = np.nan
 
-        # 3. Urban Pluvial Flood Susceptibility & Return Period Depths (m)
-        uf_score = round(min(100.0, max(0.0,
-            100.0 * (0.45 * max(0.0, 1.0 - hand_m / 10.0) +
-                     0.35 * max(0.0, 1.0 - slope / 5.0) +
-                     0.20 * min(1.0, twi / 14.0))
-        )), 1)
-        uf_rp10 = round(max(0.0, (uf_score - 55.0) * 0.022), 2)
-        uf_rp50 = round(max(0.0, (uf_score - 40.0) * 0.025), 2)
-        uf_rp100 = round(max(0.0, (uf_score - 30.0) * 0.028), 2)
-        uf_rp500 = round(max(0.0, (uf_score - 20.0) * 0.032), 2)
-        uf_adm2_baseline = grade_flood_hazard(uf_rp10, uf_rp50, uf_rp500)
-
-        # 4. Coastal Surge Curve (m)
-        if elev <= 15.0:
-            cf_rp10 = round(max(0.0, 1.8 - elev * 0.45), 2)
-            cf_rp50 = round(max(0.0, 2.5 - elev * 0.45), 2)
-            cf_rp100 = round(max(0.0, 3.0 - elev * 0.45), 2)
-            cf_rp250 = round(max(0.0, 3.6 - elev * 0.45), 2)
-            cf_rp500 = round(max(0.0, 4.1 - elev * 0.42), 2)
-            cf_rp1000 = round(max(0.0, 4.7 - elev * 0.40), 2)
+        # 3. Tropical Cyclone Wind Curve (m/s) - Raw STORM 10-min Sustained Wind
+        if "CY_RP100_ms" in g_props and g_props["CY_RP100_ms"] is not None:
+            cy_rp50 = round(float(g_props.get("CY_RP50_ms", 0.0) or 0.0), 1)
+            cy_rp100 = round(float(g_props.get("CY_RP100_ms", 0.0) or 0.0), 1)
+            cy_rp200 = round(float(g_props.get("CY_RP200_ms", 0.0) or 0.0), 1)
+            cy_rp500 = round(float(g_props.get("CY_RP500_ms", 0.0) or 0.0), 1)
+            cy_rp1000 = round(float(g_props.get("CY_RP1000_ms", 0.0) or 0.0), 1)
         else:
-            cf_rp10 = cf_rp50 = cf_rp100 = cf_rp250 = cf_rp500 = cf_rp1000 = 0.0
+            cy_rp50 = cy_rp100 = cy_rp200 = cy_rp500 = cy_rp1000 = np.nan
 
-        # 5. Tsunami Overland Attenuation Curve (m)
-        if "TS_H0_500_m" in g_props and elev < 35.0:
-            ptha_dist_km = float(g_props["TS_Coast_Dist_km"])
-            overland_km = round(min(ptha_dist_km, max(0.0, hand_m * 0.25 if elev < 12.0 else elev * 0.20)), 2)
-            est_coast_dist_km = overland_km
-            bay_damping = 0.65 if ptha_dist_km > 25.0 else 1.0
-            roughness_loss = 1.5 * overland_km
-            ts_rp100 = round(max(0.0, g_props["TS_H0_100_m"] * bay_damping - elev - roughness_loss), 2)
-            ts_rp500 = round(max(0.0, g_props["TS_H0_500_m"] * bay_damping - elev - roughness_loss), 2)
-            ts_rp1000 = round(max(0.0, g_props["TS_H0_1000_m"] * bay_damping - elev - roughness_loss), 2)
-            ts_rp2500 = round(max(0.0, g_props["TS_H0_2500_m"] * bay_damping - elev - roughness_loss), 2)
-        else:
-            est_coast_dist_km = 80.0
-            ts_rp100 = ts_rp500 = ts_rp1000 = ts_rp2500 = 0.0
-
-        # 6. Tropical Cyclone Wind Curve (3-sec Gust km/h)
-        if "CY_RP100_kmh" in g_props and g_props["CY_RP100_kmh"] is not None:
-            cy_rp50 = round(float(g_props.get("CY_RP50_kmh", 0.0) or 0.0), 1)
-            cy_rp100 = round(float(g_props.get("CY_RP100_kmh", 0.0) or 0.0), 1)
-            cy_rp200 = round(float(g_props.get("CY_RP200_kmh", 0.0) or 0.0), 1)
-            cy_rp500 = round(float(g_props.get("CY_RP500_kmh", 0.0) or 0.0), 1)
-            cy_rp1000 = round(float(g_props.get("CY_RP1000_kmh", 0.0) or 0.0), 1)
-        else:
-            cy_rp50, cy_rp100, cy_rp200, cy_rp500, cy_rp1000 = 0.0, 0.0, 0.0, 0.0, 0.0
-
-        # 7. Earthquake Seismic PGA (g)
+        # 4. Earthquake Seismic PGA (g) - Raw GEM RP475
         if "EQ_PGA_RP475_g" in g_props and g_props["EQ_PGA_RP475_g"] is not None:
             eq_pga_475 = round(float(g_props.get("EQ_PGA_RP475_g", 0.0) or 0.0), 3)
-            eq_pga_2475 = round(eq_pga_475 * 1.8, 3)
         else:
-            eq_pga_475 = 0.0
-            eq_pga_2475 = 0.0
+            eq_pga_475 = np.nan
 
-        # 8. Landslide Hazard Index (1 to 4, clamping uint8 255 NoData to 1)
+        # 5. Landslide Hazard Index (Class 1 to 4) - Raw World Bank GFDRR
         if "LS_Combined_Class" in g_props and g_props["LS_Combined_Class"] is not None:
             raw_ls = int(round(float(g_props.get("LS_Combined_Class", 1) or 1)))
             ls_combined = raw_ls if 1 <= raw_ls <= 4 else 1
@@ -520,48 +481,51 @@ def evaluate_all_perils(df, use_gee=False, asset_prefix=""):
             ls_rain = round(raw_rain if 0.0 <= raw_rain <= 10.0 else 0.0, 5)
             ls_quake = round(raw_quake if 0.0 <= raw_quake <= 10.0 else 0.0, 5)
         else:
-            ls_combined = 1
-            ls_rain = 0.0
-            ls_quake = 0.0
+            ls_combined = np.nan
+            ls_rain = np.nan
+            ls_quake = np.nan
 
-        th_river = grade_flood_hazard(fl_rp10, fl_rp50, fl_rp500)
-        th_urban = grade_flood_hazard(uf_rp10, uf_rp50, uf_rp500)
-        th_coastal = grade_flood_hazard(cf_rp10, cf_rp50, cf_rp500)
-        th_tsunami = grade_tsunami_hazard(ts_rp100, ts_rp500, ts_rp2500)
-        th_cyclone = grade_cyclone_hazard(cy_rp50, cy_rp100, cy_rp500)
+        # 6. Raw UNDRR GAR15 Tsunami Shoreline Wave Height (m) & Distance (km)
+        ts_dist_km = g_props.get("TS_Nearest_Point_Dist_km", np.nan)
+        ts_h0_100 = g_props.get("TS_Shore_H0_RP100_m", 0.0 if pd.notna(ts_dist_km) else np.nan)
+        ts_h0_500 = g_props.get("TS_Shore_H0_RP500_m", 0.0 if pd.notna(ts_dist_km) else np.nan)
+        ts_h0_1000 = g_props.get("TS_Shore_H0_RP1000_m", 0.0 if pd.notna(ts_dist_km) else np.nan)
+        ts_h0_2500 = g_props.get("TS_Shore_H0_RP2500_m", 0.0 if pd.notna(ts_dist_km) else np.nan)
+
+        # 7. Qualitative Grades (Strictly for the 4 Direct-Raster Perils)
+        th_river = grade_river_flood_hazard(fl_rp10, fl_rp50, fl_rp500)
+        th_cyclone = grade_cyclone_hazard_ms(cy_rp50, cy_rp100, cy_rp500)
         th_quake = grade_earthquake_hazard(eq_pga_475)
         th_landslide = grade_landslide_hazard(ls_combined)
 
         records.append({
+            # --- Raw Terrain & Indirect Risk Indicators ---
             "Elev_GLO30_m": elev,
-            "Slope_deg": slope,
             "HAND_m": hand_m,
-            "TWI_Index": twi,
+            "Slope_deg": slope,
+            "UPA_km2": upa_km2,
+            "TS_Nearest_Point_Dist_km": ts_dist_km,
+            "TS_Shore_H0_RP100_m": ts_h0_100,
+            "TS_Shore_H0_RP500_m": ts_h0_500,
+            "TS_Shore_H0_RP1000_m": ts_h0_1000,
+            "TS_Shore_H0_RP2500_m": ts_h0_2500,
+            # --- 4 Direct-Raster Peril Grades ---
             "TH_River_Flood": th_river,
-            "TH_Urban_Flood": th_urban,
-            "TH_Coastal_Flood": th_coastal,
-            "TH_Tsunami": th_tsunami,
             "TH_Cyclone": th_cyclone,
             "TH_Earthquake": th_quake,
             "TH_Landslide": th_landslide,
+            # --- Raw Quantitative Return-Period Curves (4 Direct-Raster Perils) ---
             "FL_RP10_m": fl_rp10, "FL_RP20_m": fl_rp20, "FL_RP50_m": fl_rp50,
             "FL_RP100_m": fl_rp100, "FL_RP200_m": fl_rp200, "FL_RP500_m": fl_rp500,
-            "UF_ADM2_Baseline": uf_adm2_baseline, "UF_Susceptibility_Score": uf_score,
-            "UF_RP10_m": uf_rp10, "UF_RP50_m": uf_rp50, "UF_RP100_m": uf_rp100, "UF_RP500_m": uf_rp500,
-            "CF_RP10_m": cf_rp10, "CF_RP50_m": cf_rp50, "CF_RP100_m": cf_rp100,
-            "CF_RP250_m": cf_rp250, "CF_RP500_m": cf_rp500, "CF_RP1000_m": cf_rp1000,
-            "TS_Coast_Dist_km": est_coast_dist_km,
-            "TS_RP100_m": ts_rp100, "TS_RP500_m": ts_rp500, "TS_RP1000_m": ts_rp1000, "TS_RP2500_m": ts_rp2500,
-            "CY_RP50_kmh": cy_rp50, "CY_RP100_kmh": cy_rp100, "CY_RP200_kmh": cy_rp200,
-            "CY_RP500_kmh": cy_rp500, "CY_RP1000_kmh": cy_rp1000,
-            "EQ_PGA_RP475_g": eq_pga_475, "EQ_PGA_RP2475_g": eq_pga_2475,
-            "LS_Rain_Index": ls_rain, "LS_Quake_Index": ls_quake, "LS_Combined_Class": ls_combined
+            "CY_RP50_ms": cy_rp50, "CY_RP100_ms": cy_rp100, "CY_RP200_ms": cy_rp200,
+            "CY_RP500_ms": cy_rp500, "CY_RP1000_ms": cy_rp1000,
+            "EQ_PGA_RP475_g": eq_pga_475,
+            "LS_Rain_Index": ls_rain, "LS_Quake_Index": ls_quake, "LS_Combined_Class": ls_combined,
         })
 
     return pd.concat([df.reset_index(drop=True), pd.DataFrame(records)], axis=1), diagnostics
 
 def run_single_point_screening(lat, lon, custom_name=""):
-    """Helper to reverse-geocode and run full 7-peril GEE screening for a single coordinate."""
     with st.spinner(f"Identifying location ({lat:.6f}, {lon:.6f}) and sampling Google Earth Engine Hazard Rasters..."):
         matched_addr, precision_label = reverse_geocode_point(lat, lon)
         site_label = custom_name.strip() if custom_name.strip() else matched_addr.split(",")[0].strip()
@@ -655,6 +619,7 @@ with tab_map:
                     st.session_state["last_evaluated_click"] = (z_lat, z_lon)
                     st.session_state["picker_version"] += 1
                     run_single_point_screening(z_lat, z_lon, custom_click_name)
+                    st.rerun()
             except Exception as e:
                 st.warning(f"Search error: {e}")
 
@@ -683,7 +648,6 @@ with tab_map:
 
     folium.LayerControl().add_to(picker_m)
 
-    # returned_objects=["last_clicked"] prevents panning/zooming from triggering unwanted reruns
     map_click_data = st_folium(
         picker_m,
         width=920,
@@ -702,6 +666,7 @@ with tab_map:
         if st.session_state.get("last_evaluated_click") != clicked_pair:
             st.session_state["last_evaluated_click"] = clicked_pair
             run_single_point_screening(clicked_lat, clicked_lon, custom_click_name)
+            st.rerun()
 
     if "last_clicked_point" in st.session_state:
         sel_lat, sel_lon = st.session_state["last_clicked_point"]
@@ -712,6 +677,7 @@ with tab_map:
             if st.button("🔄 Run / Refresh Screening for Selected Point", type="primary"):
                 st.session_state["last_evaluated_click"] = (sel_lat, sel_lon)
                 run_single_point_screening(sel_lat, sel_lon, custom_click_name)
+                st.rerun()
 
 # Execute batch/manual trigger if clicked from Tab 1 or Tab 2
 if not trigger_df.empty:
@@ -725,9 +691,10 @@ if not trigger_df.empty:
             st.session_state["results_df"] = res_df
             st.session_state["diag_logs"] = diag_logs
             st.session_state["result_version"] += 1
+            st.rerun()
 
 # ==============================================================================
-# 6. OUTPUT LAYER UI (DYNAMICALLY VERSIONED SO IT ALWAYS UPDATES)
+# 6. OUTPUT LAYER UI (4 GRADED PERILS + RAW INDIRECT RISK METRICS)
 # ==============================================================================
 if "results_df" in st.session_state:
     res_df = st.session_state["results_df"]
@@ -737,7 +704,7 @@ if "results_df" in st.session_state:
     st.divider()
     hdr_left, hdr_mid, hdr_right = st.columns([3, 1, 1])
     with hdr_left:
-        st.subheader("2. Interactive Multi-Peril Map & Hazard Curve Output")
+        st.subheader("2. Interactive Multi-Peril Map & Raw Hazard Output")
     with hdr_mid:
         if st.button("🔄 Refresh Output View"):
             st.session_state["result_version"] += 1
@@ -757,8 +724,8 @@ if "results_df" in st.session_state:
 
     with col_left:
         color_peril = st.selectbox(
-            "Color Map Pins By Peril:",
-            ["TH_River_Flood", "TH_Urban_Flood", "TH_Coastal_Flood", "TH_Tsunami", "TH_Cyclone", "TH_Earthquake", "TH_Landslide"],
+            "Color Map Pins By Direct-Raster Peril Grade:",
+            ["TH_River_Flood", "TH_Cyclone", "TH_Earthquake", "TH_Landslide"],
             index=0
         )
         default_zoom = 13 if len(res_df) == 1 else 3
@@ -776,40 +743,40 @@ if "results_df" in st.session_state:
         ).add_to(m)
         folium.TileLayer("OpenTopoMap", name="Topographic Terrain Contours").add_to(m)
 
-        pin_colors = {"HIGH": "red", "MEDIUM": "orange", "LOW": "blue", "VERY LOW": "green"}
+        pin_colors = {"HIGH": "red", "MEDIUM": "orange", "LOW": "blue", "VERY LOW": "green", "N/A": "gray"}
 
         for _, r in res_df.iterrows():
             grade_val = r[color_peril]
             marker_color = pin_colors.get(grade_val, "gray")
+            ts_dist_str = f"{r['TS_Nearest_Point_Dist_km']} km" if pd.notna(r["TS_Nearest_Point_Dist_km"]) else ">80 km (Inland)"
             popup_html = f"""
-            <div style="font-family: Arial, sans-serif; width: 320px; font-size: 12px;">
+            <div style="font-family: Arial, sans-serif; width: 340px; font-size: 12px;">
                 <h4 style="margin: 0 0 4px 0;">{r['Name']} ({r['Location_ID']})</h4>
                 <b>Coords:</b> {r['Lat']:.5f}, {r['Lon']:.5f} ({r['Geocode_Precision']})<br>
-                <b>Elevation (GLO-30):</b> {r['Elev_GLO30_m']} m | <b>Slope:</b> {r['Slope_deg']}&deg; | <b>HAND:</b> {r['HAND_m']} m
                 <hr style="margin: 5px 0;">
-                <b>River Flood:</b> <b>{r['TH_River_Flood']}</b><br>
+                <b><u>A. 4 Graded Direct-Raster Perils</u></b><br>
+                <b>River Flood (JRC):</b> <b>{r['TH_River_Flood']}</b><br>
                 <small>RP10={r['FL_RP10_m']}m | RP50={r['FL_RP50_m']}m | RP100={r['FL_RP100_m']}m | RP500={r['FL_RP500_m']}m</small><br>
-                <b>Urban Flood:</b> <b>{r['TH_Urban_Flood']}</b> (Score: {r['UF_Susceptibility_Score']}/100)<br>
-                <small>RP10={r['UF_RP10_m']}m | RP50={r['UF_RP50_m']}m | RP100={r['UF_RP100_m']}m | RP500={r['UF_RP500_m']}m</small><br>
-                <b>Coastal Surge:</b> <b>{r['TH_Coastal_Flood']}</b><br>
-                <small>RP10={r['CF_RP10_m']}m | RP100={r['CF_RP100_m']}m | RP500={r['CF_RP500_m']}m | RP1000={r['CF_RP1000_m']}m</small><br>
-                <b>Tsunami:</b> <b>{r['TH_Tsunami']}</b><br>
-                <small>RP100={r['TS_RP100_m']}m | RP500={r['TS_RP500_m']}m | RP2500={r['TS_RP2500_m']}m</small><br>
-                <b>Cyclone Wind:</b> <b>{r['TH_Cyclone']}</b><br>
-                <small>RP50={r['CY_RP50_kmh']} | RP100={r['CY_RP100_kmh']} | RP500={r['CY_RP500_kmh']} km/h</small><br>
-                <b>Earthquake:</b> <b>{r['TH_Earthquake']}</b> <small>(RP475={r['EQ_PGA_RP475_g']}g | RP2475={r['EQ_PGA_RP2475_g']}g)</small><br>
-                <b>Landslide:</b> <b>{r['TH_Landslide']}</b> <small>(Class {r['LS_Combined_Class']}/4)</small>
+                <b>Cyclone 10-min Wind (STORM):</b> <b>{r['TH_Cyclone']}</b><br>
+                <small>RP50={r['CY_RP50_ms']} | RP100={r['CY_RP100_ms']} | RP500={r['CY_RP500_ms']} | RP1000={r['CY_RP1000_ms']} m/s</small><br>
+                <b>Earthquake (GEM):</b> <b>{r['TH_Earthquake']}</b> <small>(RP475 PGA = {r['EQ_PGA_RP475_g']} g)</small><br>
+                <b>Landslide (GFDRR):</b> <b>{r['TH_Landslide']}</b> <small>(Class {r['LS_Combined_Class']}/4)</small>
+                <hr style="margin: 5px 0;">
+                <b><u>B. Raw Indirect Risk Metrics (Coastal, Urban & Tsunami)</u></b><br>
+                <b>Elevation (GLO-30):</b> {r['Elev_GLO30_m']} m | <b>HAND:</b> {r['HAND_m']} m<br>
+                <b>Slope:</b> {r['Slope_deg']}&deg; | <b>Upstream Area (UPA):</b> {r['UPA_km2']} km&sup2;<br>
+                <b>Tsunami Nearest PTHA Point:</b> {ts_dist_str}<br>
+                <small>Shore H0: RP100={r['TS_Shore_H0_RP100_m']}m | RP500={r['TS_Shore_H0_RP500_m']}m | RP2500={r['TS_Shore_H0_RP2500_m']}m</small>
             </div>
             """
             folium.Marker(
                 location=[float(r["Lat"]), float(r["Lon"])],
-                popup=folium.Popup(popup_html, max_width=340),
-                tooltip=f"{r['Name']} | Elev: {r['Elev_GLO30_m']}m | {color_peril}: {grade_val}",
+                popup=folium.Popup(popup_html, max_width=360),
+                tooltip=f"{r['Name']} | Elev: {r['Elev_GLO30_m']}m | HAND: {r['HAND_m']}m | {color_peril}: {grade_val}",
                 icon=folium.Icon(color=marker_color, icon="info-sign")
             ).add_to(m)
 
         folium.LayerControl().add_to(m)
-        # Dynamic key tied to result_version forces the output map to re-center on every update
         st_folium(
             m,
             width=720,
@@ -819,22 +786,24 @@ if "results_df" in st.session_state:
         )
 
     with col_right:
-        st.markdown("##### Executive Summary: ThinkHazard! Risk Grades")
+        st.markdown("##### Executive Summary: 4 Peril Grades & Raw Indirect Risk Metrics")
         exec_cols = [
-            "Location_ID", "Name", "Elev_GLO30_m",
-            "TH_River_Flood", "TH_Urban_Flood", "TH_Coastal_Flood",
-            "TH_Tsunami", "TH_Cyclone", "TH_Earthquake", "TH_Landslide"
+            "Location_ID", "Name",
+            "TH_River_Flood", "TH_Cyclone", "TH_Earthquake", "TH_Landslide",
+            "Elev_GLO30_m", "HAND_m", "Slope_deg", "UPA_km2",
+            "TS_Nearest_Point_Dist_km", "TS_Shore_H0_RP500_m", "TS_Shore_H0_RP2500_m"
         ]
-        st.dataframe(res_df[exec_cols], height=390)
+        st.dataframe(res_df[exec_cols], height=390, key=f"exec_df_v{ver}")
 
         csv_export = res_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            label="📥 Export Full Raw Return-Period Dataset & Grades (CSV)",
+            label="📥 Export Full 100% Raw Dataset & Grades (CSV)",
             data=csv_export,
-            file_name="multi_peril_hazard_return_periods_export.csv",
+            file_name="multi_peril_raw_hazard_export.csv",
             mime="text/csv",
-            type="primary"
+            type="primary",
+            key=f"dl_btn_v{ver}"
         )
 
-    st.markdown("##### Complete Quantitative Return-Period Hazard Curve Table (All 42 Columns)")
-    st.dataframe(res_df)
+    st.markdown("##### Complete 100% Raw Quantitative Hazard & Terrain Table (All 31 Columns)")
+    st.dataframe(res_df, key=f"full_df_v{ver}")
